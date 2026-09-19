@@ -1,0 +1,41 @@
+Run:
+    python chat.py
+"""
+
+import pickle
+import torch
+from model import BobGPT
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+checkpoint = torch.load("bob_checkpoint.pt", map_location=device)
+with open("data/meta.pkl", "rb") as f:
+    meta = pickle.load(f)
+stoi, itos = meta["stoi"], meta["itos"]
+
+model = BobGPT(**checkpoint["config"]).to(device)
+model.load_state_dict(checkpoint["model_state"])
+model.eval()
+
+def encode(s: str):
+    return [stoi[c] for c in s if c in stoi]
+
+def decode(ids):
+    return "".join(itos[i] for i in ids)
+
+
+print("Bob is ready. Type a prompt (Ctrl+C to quit).\n")
+while True:
+    try:
+        prompt = input("You: ")
+    except (KeyboardInterrupt, EOFError):
+        print("\nBye.")
+        break
+
+    if not prompt:
+        prompt = "\n"
+
+    idx = torch.tensor([encode(prompt)], dtype=torch.long, device=device)
+    out = model.generate(idx, max_new_tokens=300, temperature=0.8, top_k=40)
+    generated = decode(out[0].tolist())
+    print(f"Bob: {generated[len(prompt):]}\n")
