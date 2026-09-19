@@ -1,0 +1,195 @@
+import math
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+
+
+class CausalSelfAttention(nn.Module):
+    """
+    Multi-head self-attention with a causal mask.
+
+    Given a sequence of token embeddings, each position computes a Query,
+    Key, and Value. Query·Key similarity (scaled) becomes attention weights
+    via softmax; the output is a weighted sum of Values. The causal mask
+    zeroes out attention to future positions so position i can only look
+    at positions <= i.
+    """
+
+    def __init__(self, n_embd: int, n_head: int, block_size: int, dropout: float):
+        super().__init__()
+        assert n_embd % n_head == 0, "embedding dim must divide evenly across heads"
+        self.n_head = n_head
+        self.head_dim = n_embd // n_head
+
+        # One linear layer that produces Q, K, V all at once (more efficient
+        # than three separate layers).
+        self.qkv_proj = nn.Linear(n_embd, 3 * n_embd)
+        # Output projection after concatenating all heads back together.
+        self.out_proj = nn.Linear(n_embd, n_embd)
+
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+
+        # Precompute the causal mask once. Shape: (1, 1, block_size, block_size).
+        # A lower-triangular matrix of 1s -- position i can attend to j <= i.
+        mask = torch.tril(torch.ones(block_size, block_size))
+        self.register_buffer("causal_mask", mask.view(1, 1, block_size, block_size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, C = x.shape  # batch, sequence length, embedding dim
+
+        qkv = self.qkv_proj(x)  # (B, T, 3*C)
+        q, k, v = qkv.split(C, dim=2)  # each (B, T, C)
+
+        # Reshape so each head gets its own slice of the embedding dim.
+        # (B, T, C) -> (B, n_head, T, head_dim)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+        # Scaled dot-product attention scores: (B, n_head, T, T)
+        # Scaling by sqrt(head_dim) keeps the softmax from saturating as
+        # dimensionality grows.
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        # Apply the causal mask: forbidden positions get -inf so softmax
+        # sends their weight to ~0.
+        att = att.masked_fill(self.causal_mask[:, :, :T, :T] == 0, float("-inf"))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+
+        out = att @ v  # (B, n_head, T, head_dim)
+
+        # Concatenate heads back into one embedding vector per position.
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        out = self.resid_dropout(self.out_proj(out))
+        return out
+
+
+class FeedForward(nn.Module):
+    """
+    Position-wise MLP applied independently to every token's vector.
+    Standard choice: expand to 4x the embedding dim, apply GELU, project back.
+    This is where a lot of the model's per-token "reasoning capacity" lives.
+    """
+
+    def __init__(self, n_embd: int, dropout: float):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.GELU(),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class Block(nn.Module):
+    """
+    One transformer block: attention sublayer + feedforward sublayer,
+    each wrapped in a residual connection and preceded by LayerNorm
+    (this ordering is called "pre-norm" and trains more stably than
+    the original post-norm design).
+    """
+
+    def __init__(self, n_embd: int, n_head: int, block_size: int, dropout: float):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.attn = CausalSelfAttention(n_embd, n_head, block_size, dropout)
+        self.ln2 = nn.LayerNorm(n_embd)
+        self.ff = FeedForward(n_embd, dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Residual connections: x = x + f(x). This is what lets gradients
+        # flow cleanly through many stacked blocks.
+        x = x + self.attn(self.ln1(x))
+        x = x + self.ff(self.ln2(x))
+        return x
+
+
+class BobGPT(nn.Module):
+    """
+    The full model: token embedding + positional embedding -> N transformer
+    blocks -> final LayerNorm -> linear head projecting back to vocabulary
+    logits.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        block_size: int,
+        n_embd: int = 128,
+        n_head: int = 4,
+        n_layer: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.block_size = block_size
+
+        self.token_emb = nn.Embedding(vocab_size, n_embd)
+        self.pos_emb = nn.Embedding(block_size, n_embd)
+        self.drop = nn.Dropout(dropout)
+
+        self.blocks = nn.ModuleList(
+            [Block(n_embd, n_head, block_size, dropout) for _ in range(n_layer)]
+        )
+        self.ln_f = nn.LayerNorm(n_embd)
+        self.head = nn.Linear(n_embd, vocab_size, bias=False)
+
+        self.apply(self._init_weights)
+        n_params = sum(p.numel() for p in self.parameters())
+        print(f"BobGPT initialized: {n_params/1e6:.2f}M parameters")
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None):
+        B, T = idx.shape
+        assert T <= self.block_size, f"sequence length {T} exceeds block_size {self.block_size}"
+
+        pos = torch.arange(0, T, device=idx.device).unsqueeze(0)  # (1, T)
+        x = self.token_emb(idx) + self.pos_emb(pos)  # (B, T, n_embd)
+        x = self.drop(x)
+
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        logits = self.head(x)  # (B, T, vocab_size)
+
+        loss = None
+        if targets is not None:
+            # Next-token prediction: compare every position's prediction
+            # against the token that actually came next.
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1)
+            )
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 0.8, top_k: int = None):
+        """
+        Autoregressive sampling: repeatedly predict the next token,
+        sample from the distribution, append, repeat.
+        """
+        self.eval()
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -self.block_size:]  # crop to context window
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] / temperature  # last position's logits
+
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = float("-inf")
+
+            probs = F.softmax(logits, dim=-1)
+            next_idx = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, next_idx), dim=1)
+        self.train()
+        return idx
